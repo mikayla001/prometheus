@@ -25,6 +25,12 @@ def pytest_addoption(parser):
         default=False,
         help="Run slow end-to-end simulation tests (may take several minutes)",
     )
+    parser.addoption(
+        "--timing",
+        action="store_true",
+        default=False,
+        help="Run timing benchmarks (use with -s to see the results table)",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -32,4 +38,9 @@ def pytest_collection_modifyitems(config, items):
         skip = pytest.mark.skip(reason="slow e2e test; pass --run-slow to enable")
         for item in items:
             if "slow" in item.keywords:
+                item.add_marker(skip)
+    if not config.getoption("--timing"):
+        skip = pytest.mark.skip(reason="timing benchmark; pass --timing to enable")
+        for item in items:
+            if "timing" in item.keywords:
                 item.add_marker(skip)

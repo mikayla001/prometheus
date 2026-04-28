@@ -44,7 +44,10 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["slow: end-to-end simulation tests (deselected by default; use --run-slow)"]
+markers = [
+    "slow: end-to-end simulation tests (deselected by default; use --run-slow)",
+    "timing: timing benchmarks (deselected by default; use --timing -s)",
+]
 
 [tool.ruff]
 line-length = 100
