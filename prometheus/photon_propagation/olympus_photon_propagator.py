@@ -1,3 +1,4 @@
+import functools
 import warnings
 from pathlib import Path
 
@@ -113,6 +114,9 @@ class OlympusPhotonPropagator(PhotonPropagator):
             counts_path,
             c_medium=self._c_medium_f(self.config["simulation"]["wavelength"]) / 1e9,
         )
+        self._cascade_converter = functools.partial(
+            make_realistic_cascade_source, moliere_rand=True, resolution=0.2
+        )
 
     def propagate(self, particle: Particle, rng_key):
         """Simulate losses and propagate resulting photons for an input particle.
@@ -162,15 +166,11 @@ class OlympusPhotonPropagator(PhotonPropagator):
             )
         # Cascades
         else:
-            import functools
-
             res_event, _ = generate_cascade(
                 self.detector,
                 injection_event,
                 seed=rng_key,
-                converter_func=functools.partial(
-                    make_realistic_cascade_source, moliere_rand=True, resolution=0.2
-                ),
+                converter_func=self._cascade_converter,
                 pprop_func=self._gen_ph,
                 splitter=self.config["simulation"]["splitter"],
             )

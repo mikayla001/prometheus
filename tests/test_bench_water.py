@@ -4,7 +4,8 @@ Marked ``timing`` — only runs when ``--timing`` is passed::
 
     pytest tests/test_bench_water.py --timing -s
 
-``-s`` lets the timing table print to stdout.
+``-s`` lets the timing table print to stdout.  Results are also written to
+``benchmarks/water_<timestamp>.json`` at the repository root.
 
 Three stages are measured for each repetition:
 
@@ -16,6 +17,8 @@ Three stages are measured for each repetition:
 """
 
 import copy
+import json
+import pathlib
 import time
 
 import numpy as np
@@ -135,3 +138,22 @@ def test_bench_water(tmp_path):
     print(f"  {'Fennel':<{col}} {np.mean(fennel):>10.2f} {np.std(fennel):>9.2f} {ms_per_evt(fennel):>11} {pct(fennel):>8}")
     print(f"  {'Flow inference':<{col}} {np.mean(flow):>10.2f} {np.std(flow):>9.2f} {ms_per_evt(flow):>11} {pct(flow):>8}")
     print(f"{'=' * 62}")
+
+    # ── Persist results ───────────────────────────────────────────────────────
+    import datetime
+
+    out_dir = pathlib.Path(__file__).parent.parent / "benchmarks"
+    out_dir.mkdir(exist_ok=True)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_file = out_dir / f"water_{timestamp}.json"
+    results = {
+        "timestamp": timestamp,
+        "n_events": N_EVENTS,
+        "n_reps": N_REPS,
+        "fixed_energy_gev": FIXED_ENERGY_GEV,
+        "total_s": {"mean": float(np.mean(total)), "std": float(np.std(total))},
+        "fennel_s": {"mean": float(np.mean(fennel)), "std": float(np.std(fennel))},
+        "flow_s": {"mean": float(np.mean(flow)), "std": float(np.std(flow))},
+    }
+    out_file.write_text(json.dumps(results, indent=2))
+    print(f"  Results written to {out_file}")

@@ -1,3 +1,4 @@
+import functools
 import pickle
 
 import awkward as ak
@@ -16,6 +17,31 @@ from hyperion.models.photon_arrival_time_nflow.net import (
 from prometheus.compat.haiku_unpickler import load as haiku_load
 
 from .utils import sources_to_model_input, sources_to_model_input_per_module
+
+
+def _next_bucket(n, base=2):
+    """Return the smallest power of *base* that is >= *n*.
+
+    Base 2 is the default: it limits worst-case padding to < 2× the true count
+    (vs up to 4× with base 4), which matters when individual pairs carry millions
+    of photons at high neutrino energies.
+
+    Parameters
+    ----------
+    n : int
+        Count to bucket.
+    base : int, optional
+        Bucketing base. Default is 2.
+
+    Returns
+    -------
+    int
+        Smallest ``base ** k`` satisfying ``base ** k >= n``.
+    """
+    if n <= 0:
+        return 1
+    log_cnt = np.log(n) / np.log(base)
+    return int(np.power(base, np.ceil(log_cnt)))
 
 
 # @profile
@@ -42,25 +68,37 @@ def make_generate_norm_flow_photons(shape_model_path, counts_model_path, c_mediu
 
     counts_net = make_counts_net_fn(counts_config)
 
-    # def sample_model(traf_params, key):
-    # return sample_shape_model(dist_builder, traf_params,
-    # traf_params.shape[0], key)
+    @functools.partial(jax.jit, static_argnums=(1,))
+    def sample_single_pair(traf_p, n_padded, key):
+        """Sample *n_padded* photon arrival times for one (source, module) pair.
 
-    @jax.jit
-    def sample_model_inner(traf_params, key):
-        return sample_shape_model(dist_builder, traf_params, traf_params.shape[0], key)
+        Accepts 1-D flow parameters for a single pair so the spline knot arrays
+        stay at shape ``(num_bins + 1,)`` rather than ``(n_photons, num_bins + 1)``.
+        The ``jnp.vectorize`` inside ``_Flow.forward`` broadcasts the 1-D knots
+        over the ``n_padded`` base samples, giving the same result as the former
+        ``jnp.repeat`` approach while using O(num_bins) memory for knots instead
+        of O(n_photons × num_bins).
 
-    def sample_model(traf_params, key):
+        ``n_padded`` is a static argument so JAX compiles one kernel per bucket
+        size (powers of 2) and reuses it across events.
 
-        base = 4
-        log_cnt = np.log(traf_params.shape[0]) / np.log(base)
-        pad_len = int(np.power(base, np.ceil(log_cnt)))
+        Parameters
+        ----------
+        traf_p : jnp.ndarray
+            Flow transformation parameters for one pair, shape ``(n_flow_params,)``.
+        n_padded : int
+            Number of samples to draw; must equal ``_next_bucket(n_actual)``.
+        key : jax.random.PRNGKey
+            JAX PRNG key.
 
-        padded = jnp.pad(traf_params, ((0, pad_len - traf_params.shape[0]), (0, 0)))
-
-        result = sample_model_inner(padded, key)
-
-        return result[: traf_params.shape[0]]
+        Returns
+        -------
+        jnp.ndarray
+            Sampled arrival times, shape ``(n_padded,)``.
+        """
+        base_dist, trafo = dist_builder(traf_p)
+        base_samples = base_dist.sample(seed=key, sample_shape=(n_padded,))
+        return trafo.forward(base_samples)
 
     def generate_norm_flow_photons(
         module_coords,
@@ -71,37 +109,94 @@ def make_generate_norm_flow_photons(shape_model_path, counts_model_path, c_mediu
         source_nphotons,
         seed=31337,
     ):
+        """Generate photon arrival times at each detector module using the normalizing flow.
 
-        # TODO: Reimplement using padding / bucket compile (jax.mask???)
+        Computes expected photon counts via the count network, samples the
+        detected photon count per module with Poisson statistics, then samples
+        arrival times from the normalizing-flow shape model.
 
+        Source arrays and distance-masked input arrays are bucket-padded to the
+        next power-of-2 length before every JIT-compiled network call so that
+        JAX reuses compiled kernels across events with different source counts
+        rather than retracing on every invocation. Arrival times are then
+        sampled per (source, module) pair to avoid materialising a
+        ``[total_photons, n_flow_params]`` array.
+
+        Parameters
+        ----------
+        module_coords : jnp.ndarray
+            Detector module positions, shape ``(n_modules, 3)``.
+        module_efficiencies : jnp.ndarray
+            Per-module quantum efficiency factors, shape ``(n_modules,)``.
+        source_pos : jnp.ndarray
+            Photon source positions, shape ``(n_sources, 3)``.
+        source_dir : jnp.ndarray
+            Photon source directions, shape ``(n_sources, 3)``.
+        source_time : jnp.ndarray
+            Photon source emission times, shape ``(n_sources, 1)``.
+        source_nphotons : jnp.ndarray
+            Number of photons emitted per source, shape ``(n_sources, 1)``.
+        seed : int or jax.random.PRNGKey, optional
+            Random seed or JAX PRNG key. Default is 31337.
+
+        Returns
+        -------
+        ak.Array
+            Ragged array of detected photon arrival times, one inner list per
+            module, length ``n_modules``.
+        """
         if isinstance(seed, int):
             key = random.PRNGKey(seed)
         else:
             key = seed
 
+        n_sources = source_pos.shape[0]
+
+        # Bucket-pad source arrays to the next power-of-4 length so that
+        # sources_to_model_input (jit + vmap over sources) sees a stable shape
+        # across events and does not retrace for every unique source count.
+        # Padded positions are placed far from the detector so the 300 m
+        # distance mask filters them out; all real source-module pairs are
+        # preserved because the vmap axis is sources, not modules.
+        src_bucket = _next_bucket(n_sources)
+        if src_bucket > n_sources:
+            src_pad = src_bucket - n_sources
+            source_pos_jit = jnp.pad(
+                source_pos, ((0, src_pad), (0, 0)), constant_values=1e7
+            )
+            source_dir_jit = jnp.pad(source_dir, ((0, src_pad), (0, 0)))
+            source_time_jit = jnp.pad(source_time, ((0, src_pad), (0, 0)))
+        else:
+            source_pos_jit = source_pos
+            source_dir_jit = source_dir
+            source_time_jit = source_time
+
         inp_pars, time_geo = sources_to_model_input(
             module_coords,
-            source_pos,
-            source_dir,
-            source_time,
+            source_pos_jit,
+            source_dir_jit,
+            source_time_jit,
             c_medium,
         )
+
+        # Discard padded rows before any further computation.
+        inp_pars = inp_pars[:n_sources]
+        time_geo = time_geo[:n_sources]
 
         inp_pars = jnp.swapaxes(inp_pars, 0, 1)
         time_geo = jnp.swapaxes(time_geo, 0, 1)
 
-        # flatten [densely pack [modules, sources] in 1D array]
+        # Flatten: densely pack [modules, sources] into a 1-D index.
         inp_pars = inp_pars.reshape(
-            (source_pos.shape[0] * module_coords.shape[0], inp_pars.shape[-1])
+            (n_sources * module_coords.shape[0], inp_pars.shape[-1])
         )
         time_geo = time_geo.reshape(
-            (source_pos.shape[0] * module_coords.shape[0], time_geo.shape[-1])
+            (n_sources * module_coords.shape[0], time_geo.shape[-1])
         )
         source_photons = jnp.tile(source_nphotons, module_coords.shape[0]).T.ravel()
-        mod_eff_factor = jnp.repeat(module_efficiencies, source_pos.shape[0])
+        mod_eff_factor = jnp.repeat(module_efficiencies, n_sources)
 
-        # Normalizing flows only built up to 300
-        # TODO: Check lower bound as well
+        # Normalizing flows only built up to 300 m.
         distance_mask = inp_pars[:, 0] < np.log10(300)
 
         inp_params_masked = inp_pars[distance_mask]
@@ -109,10 +204,24 @@ def make_generate_norm_flow_photons(shape_model_path, counts_model_path, c_mediu
         source_photons_masked = source_photons[distance_mask]
         mod_eff_factor_masked = mod_eff_factor[distance_mask]
 
-        # Eval count net to obtain survival fraction
-        ph_frac = jnp.power(10, counts_net.apply(counts_params, inp_params_masked)).squeeze()
+        n_masked = inp_params_masked.shape[0]
+        if n_masked == 0:
+            return ak.Array([])
 
-        # Sample number of detected photons
+        # Bucket-pad the distance-masked arrays to the next power-of-2 length
+        # so that the JIT-compiled count network and flow conditioner see a
+        # stable shape and do not retrace for every unique masked count.
+        # Outputs are sliced back to n_masked to discard padding rows.
+        masked_bucket = _next_bucket(n_masked)
+        masked_pad = masked_bucket - n_masked
+        inp_params_padded = jnp.pad(inp_params_masked, ((0, masked_pad), (0, 0)))
+
+        # Evaluate count network to obtain photon survival fraction.
+        ph_frac = jnp.power(
+            10, counts_net.apply(counts_params, inp_params_padded)
+        ).reshape(-1)[:n_masked]
+
+        # Sample number of detected photons per (source, module) pair.
         n_photons_masked = ph_frac * source_photons_masked * mod_eff_factor_masked
 
         key, subkey = random.split(key)
@@ -123,34 +232,40 @@ def make_generate_norm_flow_photons(shape_model_path, counts_model_path, c_mediu
         )
 
         if jnp.all(n_photons_masked == 0):
-            times = [] * module_coords.shape[0]
-            return ak.Array(times)
+            return ak.Array([])
 
-        # Obtain flow parameters and repeat them for each detected photon
-        traf_params = apply_fn(shape_params, inp_params_masked)
-        traf_params_rep = jnp.repeat(traf_params, n_photons_masked, axis=0)
-        # Also repeat the geometric time for each detected photon
-        time_geo_rep = jnp.repeat(time_geo_masked, n_photons_masked, axis=0).squeeze()
+        # Obtain flow transformation parameters; slice to discard padding rows.
+        traf_params = apply_fn(shape_params, inp_params_padded)[:n_masked]
 
-        # Calculate number of photons per module
-        # Start with zero array and fill in the poisson samples using distance mask
-        n_photons = jnp.zeros(source_pos.shape[0] * module_coords.shape[0], dtype=jnp.int32)
+        # Fill detected photon counts back into the full flat (module × source)
+        # layout so the per-module split indices stay aligned.
+        n_photons = jnp.zeros(n_sources * module_coords.shape[0], dtype=jnp.int32)
         n_photons = n_photons.at[distance_mask].set(n_photons_masked)
-        n_photons = n_photons.reshape(module_coords.shape[0], source_pos.shape[0])
+        n_photons = n_photons.reshape(module_coords.shape[0], n_sources)
         n_ph_per_mod = np.sum(n_photons, axis=1)
 
-        # Sample times from flow
-        key, subkey = random.split(key)
-        samples = sample_model(traf_params_rep, subkey)
-        times = np.atleast_1d(np.asarray(samples.squeeze() + time_geo_rep))
+        # Materialise counts and geometric times to CPU once to avoid repeated
+        # device syncs inside the loop below.
+        n_ph_cpu = np.asarray(n_photons_masked)
+        t_geo_cpu = np.atleast_1d(np.asarray(time_geo_masked.squeeze()))
 
-        if len(times) == 1:
-            ix = np.argwhere(n_ph_per_mod).squeeze()
-            times = [[] if i != ix else times for i in range(module_coords.shape[0])]
-        else:
-            # Split per module and convert to awkward.Array
-            times = np.split(times, np.cumsum(n_ph_per_mod)[:-1])
+        # Sample arrival times per (source, module) pair using 1-D flow params.
+        # Avoids materialising the [total_photons, n_flow_params] array that the
+        # previous jnp.repeat approach required; knot arrays stay at O(num_bins)
+        # instead of O(n_photons × num_bins) for the full event.
+        all_pair_times = []
+        for i in range(n_masked):
+            n_i = int(n_ph_cpu[i])
+            if n_i == 0:
+                continue
+            key, subkey = random.split(key)
+            raw = sample_single_pair(traf_params[i], _next_bucket(n_i), subkey)
+            all_pair_times.append(np.asarray(raw[:n_i]) + t_geo_cpu[i])
 
+        times = np.atleast_1d(
+            np.concatenate(all_pair_times) if all_pair_times else np.array([])
+        )
+        times = np.split(times, np.cumsum(n_ph_per_mod)[:-1])
         return ak.Array(times)
 
     return generate_norm_flow_photons
