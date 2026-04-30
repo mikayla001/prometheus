@@ -279,22 +279,40 @@ def make_generate_norm_flow_photons(shape_model_path, counts_model_path, c_mediu
 
         pair_times: list = [None] * n_masked
 
-        # Low-count pairs (≤ BATCH_CAP): one vmapped kernel call.
-        low_idx = np.where((n_ph_cpu > 0) & (n_ph_cpu <= BATCH_CAP))[0]
-        if len(low_idx) > 0:
-            n_max = int(_next_bucket(int(n_ph_cpu[low_idx].max())))
+        # Group pairs by their individual bucket size and call sample_batch once
+        # per group.  This keeps n_max a stable static arg across events — the
+        # same compiled kernel is reused for every event that contains a pair
+        # with a given bucket size, avoiding per-event XLA recompilation that
+        # would otherwise occur when using the global maximum as n_max.
+        bucket_groups: dict[int, list[int]] = {}
+        for i in np.where(n_ph_cpu > 0)[0]:
+            n_i = int(n_ph_cpu[i])
+            b = _next_bucket(n_i)
+            if b <= BATCH_CAP:
+                bucket_groups.setdefault(b, []).append(int(i))
+            else:
+                # High-count pairs: sequential fallback to cap memory.
+                raw = sample_single_pair(traf_params[i], b, subkeys[i])
+                pair_times[i] = np.asarray(raw[:n_i]) + t_geo_cpu[i]
+
+        for bucket_size, indices in bucket_groups.items():
+            idx = np.array(indices, dtype=np.int32)
+            n_in_batch = len(idx)
+            batch_b = _next_bucket(n_in_batch)
+            # Pad batch index to next power-of-2 so XLA sees a stable shape
+            # across events and does not recompile when the per-bucket pair
+            # count changes with different Poisson draws.  Padded slots borrow
+            # index 0; their output rows are discarded after the call.
+            if batch_b > n_in_batch:
+                idx = np.concatenate(
+                    [idx, np.zeros(batch_b - n_in_batch, dtype=np.int32)]
+                )
             batch_raw = np.asarray(
-                sample_batch(traf_params[low_idx], n_max, subkeys[low_idx])
+                sample_batch(traf_params[idx], bucket_size, subkeys[idx])
             )
-            for j, i in enumerate(low_idx):
+            for j, i in enumerate(indices):
                 n_i = int(n_ph_cpu[i])
                 pair_times[i] = batch_raw[j, :n_i] + t_geo_cpu[i]
-
-        # High-count pairs (> BATCH_CAP): sequential fallback to cap memory.
-        for i in np.where(n_ph_cpu > BATCH_CAP)[0]:
-            n_i = int(n_ph_cpu[i])
-            raw = sample_single_pair(traf_params[i], _next_bucket(n_i), subkeys[i])
-            pair_times[i] = np.asarray(raw[:n_i]) + t_geo_cpu[i]
 
         all_pair_times = [t for t in pair_times if t is not None]
 
