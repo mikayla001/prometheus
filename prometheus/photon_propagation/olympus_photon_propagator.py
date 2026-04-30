@@ -162,7 +162,6 @@ class OlympusPhotonPropagator(PhotonPropagator):
                 key=rng_key,
                 pprop_func=self._gen_ph,
                 proposal_prop=proposal_prop,
-                splitter=self.config["simulation"]["splitter"],
             )
         # Cascades
         else:
@@ -172,7 +171,6 @@ class OlympusPhotonPropagator(PhotonPropagator):
                 seed=rng_key,
                 converter_func=self._cascade_converter,
                 pprop_func=self._gen_ph,
-                splitter=self.config["simulation"]["splitter"],
             )
 
         hits = []

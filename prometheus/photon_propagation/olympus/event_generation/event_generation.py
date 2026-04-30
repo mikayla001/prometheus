@@ -47,7 +47,6 @@ def generate_cascade(
     seed,
     pprop_func,
     converter_func,
-    splitter=100000,
 ):
     """Generate a single cascade and return detected photon times.
 
@@ -64,8 +63,6 @@ def generate_cascade(
     converter_func : callable
         Callable that converts event energy and metadata to source positions,
         directions, times and photon counts.
-    splitter : int, optional
-        Number of modules per subset for memory-efficient propagation.
 
     Returns
     -------
@@ -92,37 +89,15 @@ def generate_cascade(
         event_data,
     )
 
-    # splitting for memory efficiency
-    if det.module_coords.shape[0] > splitter:
-        det_subsets_coords = np.array_split(
-            det.module_coords, det.module_coords.shape[0] % splitter
-        )
-        det_subsets_eff = np.array_split(
-            det.module_efficiencies, det.module_coords.shape[0] % splitter
-        )
-        propagation_result = [
-            pprop_func(
-                det_subsets_coords[id_set],
-                det_subsets_eff[id_set],
-                source_pos,
-                source_dir,
-                source_time,
-                source_nphotons,
-                seed=k2,
-            )
-            for id_set, _ in enumerate(det_subsets_coords)
-        ]
-        propagation_result = ak.concatenate(propagation_result)
-    else:
-        propagation_result = pprop_func(
-            det.module_coords,
-            det.module_efficiencies,
-            source_pos,
-            source_dir,
-            source_time,
-            source_nphotons,
-            seed=k2,
-        )
+    propagation_result = pprop_func(
+        det.module_coords,
+        det.module_efficiencies,
+        source_pos,
+        source_dir,
+        source_time,
+        source_nphotons,
+        seed=k2,
+    )
 
     return propagation_result, record
 
@@ -329,7 +304,7 @@ def generate_muon_energy_losses(
 
 
 # @profile
-def generate_realistic_track(det, event_data, key, pprop_func, proposal_prop, splitter=100000):
+def generate_realistic_track(det, event_data, key, pprop_func, proposal_prop):
     """Generate a realistic muon track using energy losses from PROPOSAL.
 
     Parameters
@@ -344,8 +319,6 @@ def generate_realistic_track(det, event_data, key, pprop_func, proposal_prop, sp
         Photon propagation function.
     proposal_prop : callable
         PROPOSAL propagator instance.
-    splitter : int, optional
-        Split size for detector modules to reduce memory usage.
 
     Returns
     -------
@@ -395,37 +368,16 @@ def generate_realistic_track(det, event_data, key, pprop_func, proposal_prop, sp
         source_array_to_sources(source_pos, source_dir, source_time, source_photons),
         event_data,
     )
-    # splitting for memory efficiency
-    if det.module_coords.shape[0] > splitter:
-        det_subsets_coords = np.array_split(
-            det.module_coords, det.module_coords.shape[0] % splitter
-        )
-        det_subsets_eff = np.array_split(
-            det.module_efficiencies, det.module_coords.shape[0] % splitter
-        )
-        propagation_result = [
-            pprop_func(
-                det_subsets_coords[id_set],
-                det_subsets_eff[id_set],
-                source_pos,
-                source_dir,
-                source_time,
-                source_photons,
-                seed=k2,
-            )
-            for id_set, _ in enumerate(det_subsets_coords)
-        ]
-        propagation_result = ak.concatenate(propagation_result)
-    else:
-        propagation_result = pprop_func(
-            det.module_coords,
-            det.module_efficiencies,
-            source_pos,
-            source_dir,
-            source_time,
-            source_photons,
-            seed=k2,
-        )
+
+    propagation_result = pprop_func(
+        det.module_coords,
+        det.module_efficiencies,
+        source_pos,
+        source_dir,
+        source_time,
+        source_photons,
+        seed=k2,
+    )
     return propagation_result, record
 
 
