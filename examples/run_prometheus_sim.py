@@ -27,21 +27,25 @@ except Exception:
     )
     sys.exit(1)
 
-# Use CPU-only JAX
+# prefer GPU if available, otherwise fall back to CPU
 try:
     import jax
-
     jax.config.update("jax_enable_x64", True)
-    jax.config.update("jax_platform_name", "cpu")
+    if any(d.platform == "gpu" for d in jax.devices()):
+        jax.config.update("jax_platform_name", "gpu")
+        logger.info("Using JAX GPU devices")
+    else:
+        jax.config.update("jax_platform_name", "cpu")
+        logger.info("No GPU devices found; using CPU")
 except Exception:
-    pass
+    logger.warning("JAX not available; continuing without explicit JAX config")
 
 
 def main():
     # Minimal runtime configuration
-    config.run.run_number = 3
-    config.run.random_state_seed = 7003
-    config.run.nevents = 200
+    config.run.run_number = 7
+    config.run.random_state_seed = 7006
+    config.run.nevents = 5
 
     # Point storage_prefix to OUT
     out_dir = os.environ.get("OUT")
@@ -63,7 +67,7 @@ def main():
 
     # Use the demo ice geo shipped in resources/
 
-    _geo_default = "resources/geofiles/icecube.geo"
+    _geo_default = "resources/geofiles/demo_ice.geo"
     _geo_path = Path(_geo_default)
     if not _geo_path.is_absolute() and not _geo_path.exists():
         REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -74,10 +78,13 @@ def main():
     # changed PPC to PPC_CUDA to allow to run on GPU, not CPU
     config.photon_propagator.name = "PPC_CUDA"
     config.photon_propagator.ppc_cuda.paths.force = True
+    config.photon_propagator.ppc_cuda.simulation.output_mode = "extended"
 
     print("Initializing Prometheus (ice / PPC)")
     prom = Prometheus()
     print("Prometheus initialized")
+
+    
 
     try:
         prom.sim()
