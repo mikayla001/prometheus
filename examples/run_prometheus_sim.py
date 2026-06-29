@@ -78,7 +78,7 @@ def main():
     # changed PPC to PPC_CUDA to allow to run on GPU, not CPU
     config.photon_propagator.name = "PPC_CUDA"
     config.photon_propagator.ppc_cuda.paths.force = True
-    config.photon_propagator.ppc_cuda.simulation.output_mode = "extended"
+    config.photon_propagator.ppc_cuda.simulation.output_mode = "standard"
 
     print("Initializing Prometheus (ice / PPC)")
     prom = Prometheus()
